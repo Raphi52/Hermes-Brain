@@ -1,0 +1,3 @@
+name: hermes-amitel-brain
+version: 0.1.0
+description: Inject bounded, relevant Amitel Brain evidence into each Hermes user turn.

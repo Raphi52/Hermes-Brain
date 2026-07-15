@@ -1,0 +1,21 @@
+# Local runtimes and derived indexes
+.venv/
+**/.venv/
+tooling/index/
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+config.json
+service-token
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Candidate notes are local until reviewed
+inbox/*.md
+!inbox/README.md
