@@ -63,6 +63,8 @@ $runtimeFiles = @(
     "brain_context.py",
     "brain_hook.py",
     "brain_index.py",
+    # La gate de proposition : sans elle, brain_server ne peut pas importer /ingest.
+    "brain_propose.py",
     "brain_retrieval.py",
     "brain_server.py"
 )

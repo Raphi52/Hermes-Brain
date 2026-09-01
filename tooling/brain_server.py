@@ -11,11 +11,14 @@ from pathlib import Path
 from brain_context import render_hits
 from brain_retrieval import BrainRetriever
 from brain_auth import service_token, signed_context_payload
+from brain_propose import propose_note
 
 DEFAULT_PORT = 8765
 MAX_REQUEST_BYTES = 16_384
 MAX_CONTEXT_CHARS = 3_000
 MIN_DENSE = 0.25
+# Seuil du garde anti-doublon de /ingest : au-dela, le savoir canonique couvre deja le fait.
+NEAR_DUP_DENSE = 0.82
 
 
 class LocalThreadingHTTPServer(ThreadingHTTPServer):
@@ -79,6 +82,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(403, {"error": "forbidden"})
             return
+        if self.path == "/ingest":
+            self._handle_ingest(body)
+            return
         if self.path == "/shutdown":
             self._json(200, signed_context_payload(self.root_id, self.token))
             self.wfile.flush()
@@ -101,6 +107,64 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(exc)})
         except Exception:
             self._json(500, {"error": "retrieval failed"})
+
+    def _handle_ingest(self, body):
+        """POST /ingest - ecrit un CANDIDAT (fait) dans inbox/ via la gate brain_propose.
+
+        POURQUOI CETTE ROUTE EXISTE ICI. Sans elle, tout POST /ingest rendait 404 et la commande
+        `remember` d Autowin OS repondait sans rien ecrire : une panne SILENCIEUSE. Mesure du
+        2026-09-01 sur un poste installe le 31/08 : deux depots de suite perdus, zero fichier ecrit,
+        et le motif rendu a l utilisateur accusait son FAIT alors que le serveur n avait rien lu. Le
+        serveur du tooling partage portait deja la route depuis le 2026-08-20 ; l installateur, lui,
+        livrait un serveur ampute - la regression revenait donc a chaque installation.
+
+        Faits seulement (lesson/decision/preference/domain) ; jamais une regle de comportement.
+        `propose_note` est la gate : elle rejette secrets et donnees personnelles, et impose une
+        provenance verifiable. Rien n entre dans knowledge/ - inbox/ est une salle d attente, la
+        promotion est humaine, et l index ignore inbox/, donc aucune pollution avant revue.
+        """
+        try:
+            if not body:
+                raise ValueError("empty request")
+            payload = json.loads(body)
+            title = str(payload.get("title", ""))
+            note_body = str(payload.get("body", ""))
+            note_type = str(payload.get("type", ""))
+            scope = str(payload.get("scope", ""))
+            author_agent = str(payload.get("author_agent", ""))
+            model = str(payload.get("model", ""))
+            source = str(payload.get("source", ""))
+            confidence = str(payload.get("confidence", "medium")) or "medium"
+            tags = payload.get("tags") or []
+            if not isinstance(tags, list):
+                raise ValueError("tags must be a list")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        # Garde anti-doublon : si le savoir CANONIQUE couvre deja le fait, on refuse d ecrire.
+        try:
+            if self.retriever is not None and title.strip() and note_body.strip():
+                requete = title + chr(10) + note_body
+                hits = self.retriever.query(requete, k=1).get("hits", [])
+                if hits and float(hits[0].get("dense_cos", -1.0)) >= NEAR_DUP_DENSE:
+                    self._json(409, {"status": "near-duplicate",
+                                     "existing": str(hits[0].get("path", "")),
+                                     "dense_cos": float(hits[0].get("dense_cos", 0.0))})
+                    return
+        except Exception:
+            pass  # un echec de recherche ne doit jamais bloquer une proposition legitime
+        root = Path(self.root_id)
+        try:
+            path = propose_note(
+                root / "inbox", title=title, body=note_body, note_type=note_type,
+                scope=scope, author_agent=author_agent, model=model, source=source,
+                tags=tags, confidence=confidence, brain_root=root,
+            )
+            self._json(200, signed_context_payload(str(path), self.token))
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+        except Exception:
+            self._json(500, {"error": "ingest failed"})
 
     def log_message(self, _format, *_args):
         return
