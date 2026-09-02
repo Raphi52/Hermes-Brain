@@ -9,58 +9,16 @@ import sys
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
-
 from brain_context import _opened_path
+from brain_candidate_policy import (
+    ALLOWED_SOURCE_SCHEMES,
+    contains_likely_pii as _contains_likely_pii,
+    contains_likely_secret as _contains_likely_secret,
+    scan_candidate,
+    valid_source as _valid_source,
+)
 
 ALLOWED_TYPES = {"lesson", "decision", "preference", "domain"}
-ALLOWED_SOURCE_SCHEMES = {"session", "file", "url", "git", "email", "ticket", "meeting"}
-SECRET_PATTERNS = [
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.I),
-    re.compile(r"\b(?:api[_-]?key|token|password|passwd|secret)\b\s*[:=]\s*[\"']?[A-Za-z0-9_./+=-]{8,}", re.I),
-    re.compile(r"\b(?:sk|xox[baprs])-[A-Za-z0-9_-]{12,}\b", re.I),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b", re.I),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", re.I),
-]
-PII_PATTERNS = [
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I),
-    re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b", re.I),
-    re.compile(r"\b(?:\+33|0)[1-9](?:[ .-]?\d{2}){4}\b"),
-]
-
-
-def _contains_likely_secret(text: str) -> bool:
-    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
-
-
-def _contains_likely_pii(text: str) -> bool:
-    return any(pattern.search(text) for pattern in PII_PATTERNS)
-
-
-def _valid_source(source: str) -> bool:
-    scheme, separator, locator = source.strip().partition(":")
-    scheme, locator = scheme.casefold(), locator.strip()
-    if separator != ":" or scheme not in ALLOWED_SOURCE_SCHEMES or not locator:
-        return False
-    if scheme == "session":
-        return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{5,127}", locator) is not None
-    if scheme == "file":
-        return Path(locator).expanduser().is_file()
-    if scheme == "url":
-        parsed = urlparse(locator)
-        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-    if scheme == "git":
-        return re.fullmatch(r".+@[0-9a-fA-F]{7,64}", locator) is not None
-    if scheme == "email":
-        return re.fullmatch(r"<?[^<>\s@]+@[^<>\s@]+>?", locator) is not None
-    if scheme == "ticket":
-        return re.fullmatch(r"[A-Z][A-Z0-9]{1,15}-\d{1,12}", locator) is not None
-    if scheme == "meeting":
-        return re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T /][A-Za-z0-9._:+ -]{1,100})?", locator) is not None
-    return False
-
-
 def _slug(text: str) -> str:
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     return re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-") or "candidate"
@@ -98,10 +56,9 @@ def propose_note(
         raise ValueError(f"unsupported type: {note_type}")
     if not body.strip():
         raise ValueError("body is empty")
-    if _contains_likely_secret("\n".join((title, body, source))):
-        raise ValueError("likely secret detected; candidate rejected")
-    if _contains_likely_pii("\n".join((title, body))):
-        raise ValueError("likely personal data detected; candidate rejected")
+    policy_finding = scan_candidate(title, body, source, "\n".join((scope, author_agent, model, " ".join(tags or []))))
+    if policy_finding:
+        raise ValueError(f"{policy_finding}; candidate rejected")
     inbox = Path(inbox_dir).resolve()
     if inbox.name.casefold() != "inbox" or any(parent.name.casefold() == "knowledge" for parent in inbox.parents):
         raise ValueError("inbox target must be an inbox/ directory outside knowledge/")
@@ -111,7 +68,9 @@ def propose_note(
     now = datetime.now(timezone.utc)
     content = (
         "---\n"
+        "schema: amitel-brain/candidate-v1\n"
         f"type: {note_type}\n"
+        f"kind: {note_type if note_type != 'domain' else 'concept'}\n"
         f"scope: {_yaml_string(scope.strip())}\n"
         f"author_agent: {_yaml_string(author_agent.strip())}\n"
         f"model: {_yaml_string(model.strip())}\n"
@@ -119,6 +78,7 @@ def propose_note(
         "status: candidate\n"
         "supersedes: []\n"
         f"tags: {json.dumps(tags or [], ensure_ascii=False)}\n"
+        "mocs: []\n"
         f"source: {_yaml_string(source.strip())}\n"
         f"confidence: {_yaml_string(confidence)}\n"
         "---\n\n"
