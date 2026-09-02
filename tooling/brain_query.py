@@ -2,8 +2,15 @@
 """Hybrid retrieve: dense cosine + BM25 fused by RRF, with provenance."""
 import argparse
 import json
+import sys
 
 from brain_retrieval import BrainRetriever
+
+
+def configure_stdout_utf8(stdout=sys.stdout):
+    reconfigure = getattr(stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8")
 
 
 def positive_int(value):
@@ -14,6 +21,7 @@ def positive_int(value):
 
 
 def main():
+    configure_stdout_utf8()
     parser = argparse.ArgumentParser()
     parser.add_argument("--index", required=True)
     parser.add_argument("--q", required=True)
