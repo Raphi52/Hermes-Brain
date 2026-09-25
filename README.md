@@ -1,57 +1,69 @@
-# Hermes Brain
+# Hermes Brain — second brain personnel
 
-Rappel automatique d’un corpus Markdown partagé dans **Hermes Agent**, **Claude Code** et **Codex CLI**, sans envoyer les embeddings à une API.
+Mémoire personnelle d'une machine de développement Windows, rappelée automatiquement dans **Claude Code**, **Autowin OS**, **Hermes Agent** et **Codex CLI**. Tout reste local : l'indexation et les embeddings tournent sur la machine, rien n'est envoyé à une API.
 
-Le moteur :
+Ce dépôt contient **le moteur** et **le corpus** (`knowledge/`). Il est public : les notes privées vivent dans `knowledge/local/`, indexé localement mais exclu par `.gitignore`.
 
-- indexe localement `knowledge/**/*.md` avec FastEmbed ;
-- combine recherche dense et BM25 ;
-- injecte seulement quelques extraits pertinents et bornés ;
-- conserve la provenance ;
-- échoue silencieusement si le brain est indisponible ;
-- propose les nouvelles connaissances dans `inbox/` avant revue humaine.
+## Ce que contient le corpus
 
-> Ce dépôt public contient le moteur et des templates, **aucune connaissance Amitel interne**.
+```text
+knowledge/
+  machine/       profil matériel, outils installés ou absents, hooks Claude Code
+  projets/       carte des projets de développement et de leurs chemins
+  brain/         comment ce Brain est installé ici, règle dépôt public / notes privées
+  preferences/   langue et style de réponse attendus
+  local/         notes privées — jamais commitées
+  _TEMPLATE.md   modèle d'une note
+inbox/           propositions des IA, en attente de revue
+```
+
+Une note = une idée, un en-tête `type / scope / source / created / status`, un nom de fichier court en kebab-case. Une correction n'écrase pas : elle crée une nouvelle note avec `supersedes: [[ancienne-note]]`.
+
+## Le moteur
+
+- indexe `knowledge/**/*.md` avec FastEmbed (dense) + BM25 ;
+- injecte à chaque prompt quelques extraits pertinents et bornés, avec leur provenance ;
+- échoue en silence si le Brain est indisponible ;
+- reçoit les nouvelles connaissances dans `inbox/` avant revue humaine (`brain_propose.py`).
+
+Provenance du code : copie embarquée d'Autowin OS (`D:\Autowin\brain`, commit `46b6261d`), elle-même union de la PR #1 de ce dépôt et de la copie de travail `brain-tooling`. Deux écarts avec cette source : l'installateur retombe sur le Python 3 le plus récent quand 3.11 est absent, et le jeu de questions d'évaluation `tooling/eval/rag-golden.json` (propre au corpus d'entreprise) n'est pas repris.
 
 ## Installation Windows — une commande
 
-Ouvrez PowerShell dans le clone :
+Dans PowerShell, depuis le clone :
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
 
-Par défaut, le clone lui-même devient le brain. Pour connecter un brain partagé :
+Le clone lui-même devient le Brain. L'installateur :
+
+1. crée `%LOCALAPPDATA%\AmitelBrain\.venv` (uv, sinon `py -3.11`, sinon `py -3` ; Python 3.11 minimum) ;
+2. installe les dépendances de `tooling/requirements.txt` ;
+3. copie les modules d'exécution dans `%LOCALAPPDATA%\AmitelBrain\tooling` ;
+4. pose `AMITEL_BRAIN_ROOT`, `AMITEL_BRAIN_CODE_ROOT` et `AMITEL_BRAIN_PYTHON` (variables utilisateur) ;
+5. ajoute, sans écraser les autres, un hook `UserPromptSubmit` à Claude Code et Codex ;
+6. copie le plugin Hermes et l'active si la commande `hermes` existe ;
+7. construit l'index dans `tooling/index/` ;
+8. sauvegarde chaque configuration modifiée (`*.amitel-brain.<date>.bak`).
+
+Les noms « AmitelBrain » sont conservés : c'est là qu'Autowin OS cherche le moteur et sa configuration. Redémarrez ensuite Claude Code, Autowin OS, Hermes et Codex.
+
+## Ajouter ou corriger une connaissance
+
+1. Écrire la note dans `knowledge/<dossier>/` (ou `knowledge/local/` si elle est privée), en partant de `_TEMPLATE.md`.
+2. Réindexer :
 
 ```powershell
-.\install.ps1 -BrainRoot "//serveur/partage/Mon Brain"
+$python = "$env:LOCALAPPDATA\AmitelBrain\.venv\Scripts\python.exe"
+& $python tooling/brain_index.py --knowledge knowledge --out tooling/index
+& $python tooling/brain_query.py --index tooling/index --q "ma question" --k 5
 ```
 
-L’installateur :
+3. Commiter les notes publiques. `knowledge/local/` ne part jamais.
 
-1. crée `%LOCALAPPDATA%\AmitelBrain\.venv` ;
-2. installe les dépendances locales ;
-3. copie une liste fermée de modules runtime dans `%LOCALAPPDATA%\AmitelBrain\tooling` ;
-4. construit un index transactionnel ;
-5. ajoute sans écraser un hook `UserPromptSubmit` à Claude Code et Codex ;
-6. demande au `codex app-server` local le hash du handler de commande exacte, l’approuve et vérifie son état `trusted` ;
-7. installe et active le plugin Hermes ;
-8. sauvegarde chaque configuration modifiée.
-
-Le support Codex nécessite une version récente où la feature `hooks` est stable. L’installation s’arrête avec une erreur explicite si le Codex local ne sait pas découvrir ou approuver ce handler.
-
-Redémarrez ensuite Hermes, Claude Code et Codex. Les nouveaux prompts reçoivent automatiquement les extraits pertinents.
-
-## Brain d’équipe
-
-Pour connecter un partage interne, utilisez son chemin fourni par votre équipe :
-
-```powershell
-.\install.ps1 -BrainRoot "//serveur/partage/Brain équipe"
-```
-
-Le partage fournit uniquement les **données** (`knowledge/`, `inbox/` et `tooling/index/`). Aucun Python n’y est chargé à l’exécution : les hooks et le service utilisent la copie locale installée depuis le clone. Pour mettre le runtime à jour, mettez à jour un clone de confiance puis relancez `install.ps1`.
+Une IA ne modifie pas `knowledge/` directement : elle dépose une candidate dans `inbox/` avec `brain_propose.py`, et un humain la promeut.
 
 ## Désinstallation
 
@@ -59,43 +71,14 @@ Le partage fournit uniquement les **données** (`knowledge/`, `inbox/` et `tooli
 .\uninstall.ps1
 ```
 
-Le désinstalleur retire seulement les hooks et le plugin Hermes Brain. Il ne supprime ni le corpus ni les sauvegardes.
-
-## Utilisation manuelle
-
-```powershell
-$python = "$env:LOCALAPPDATA\AmitelBrain\.venv\Scripts\python.exe"
-$oldPythonPath = $env:PYTHONPATH
-Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-& $python tooling/brain_index.py --knowledge knowledge --out tooling/index
-& $python tooling/brain_query.py --index tooling/index --q "ma question" --k 5
-if ($null -ne $oldPythonPath) { $env:PYTHONPATH = $oldPythonPath }
-```
-
-## Écriture et curation
-
-Une IA ne modifie pas directement `knowledge/`. Elle dépose une candidate :
-
-```powershell
-& "$env:LOCALAPPDATA\AmitelBrain\.venv\Scripts\python.exe" tooling/brain_propose.py `
-  --inbox inbox --title "Décision" --body "..." --type decision `
-  --scope global --author-agent hermes --model "modele-utilise" `
-  --source "ticket:PROJET-123"
-```
-
-Relisez, corrigez et promouvez ensuite la note vers `knowledge/` via Git.
+Retire les hooks et le plugin. Le corpus et les sauvegardes restent.
 
 ## Sécurité
 
-- Le service écoute uniquement sur `127.0.0.1`.
-- Requêtes et réponses sont authentifiées par jeton local et HMAC.
-- Sous Windows, le jeton reçoit une ACL limitée au compte courant.
-- Le runtime Python exécuté automatiquement est local ; un contributeur du corpus partagé ne peut pas le remplacer via le partage.
-- L’installateur n’approuve pas globalement les hooks Codex : il enregistre uniquement le hash retourné pour la commande exacte ajoutée à `~/.codex/hooks.json`.
-- Les chemins de notes et de candidates sont contrôlés sur le descripteur réellement ouvert.
-- Les candidats contenant des secrets ou PII évidents sont rejetés.
-
-Limites : le scan PII est heuristique et un processus hostile exécuté sous le même compte Windows partage le même périmètre de confiance.
+- Le service n'écoute que sur `127.0.0.1`, requêtes authentifiées par jeton local et HMAC ; le jeton a une ACL limitée au compte courant.
+- Le code Python exécuté automatiquement est la copie locale installée, jamais celle d'un partage.
+- Les candidates contenant des secrets ou des données personnelles évidentes sont rejetées (détection heuristique).
+- **Dépôt public** : pas de secret, d'identifiant ni de contenu personnel dans une note commitée.
 
 ## Tests
 
@@ -103,15 +86,12 @@ Limites : le scan PII est heuristique et un processus hostile exécuté sous le 
 python -m unittest discover -s tooling/tests -v
 ```
 
-## Structure
+**État au 2026-09-25 : 120 tests, 8 rouges hérités** (3 échecs, 5 erreurs), identiques dans la copie source `D:\Autowin\brain` : ce changement n'en a ajouté aucun. Les tests sont restés sur d'anciennes versions du code :
 
-```text
-knowledge/                         corpus Markdown versionné
-inbox/                             candidates non actives
-integrations/hermes-amitel-brain/  plugin Hermes
-integrations/windows/              adaptateur Claude/Codex
-tooling/                           index, retrieval, service et tests
-```
+- 6 visent des API renommées ou élargies (`LocalThreadingHTTPServer` devenu `run_server` — 2 tests —, argument `threads` de l'embedding, liste de modules du plugin sans `brain_singleton`, signature de format de l'index, exemple de source `email:` désormais valide) ;
+- 2 décrivent un **comportement retiré** : `/health` n'indique plus quel corpus le serveur sert, `/shutdown` n'existe plus, et le hook ne redémarre plus un serveur resté sur un ancien corpus. Conséquence pratique : après un changement de `-BrainRoot`, arrêter le `brain_server` en cours avant de relancer.
+
+À corriger dans la copie source, puis à resynchroniser ici, pour ne pas faire diverger les deux copies.
 
 ## Licence
 

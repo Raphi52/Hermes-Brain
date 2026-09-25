@@ -2,6 +2,8 @@
 """Fail-open UserPromptSubmit adapter for Claude Code and Codex CLI."""
 import json
 import os
+import re
+import uuid
 import subprocess
 import sys
 import time
@@ -9,71 +11,62 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from brain_auth import service_token, verified_context
+from brain_auth import seal_request, service_token, verified_context
+from brain_singleton import ProcessMutex
 
 DEFAULT_PORT = 8765
 
 
-def _endpoint(path="/query"):
+def _endpoint():
     port = int(os.environ.get("AMITEL_BRAIN_PORT", DEFAULT_PORT))
-    return f"http://127.0.0.1:{port}{path}"
+    return f"http://127.0.0.1:{port}/query"
 
 
-def _configured_root():
-    default = Path(__file__).resolve().parents[1]
-    return str(Path(os.environ.get("AMITEL_BRAIN_ROOT", default)).resolve())
+def _port():
+    return int(os.environ.get("AMITEL_BRAIN_PORT", DEFAULT_PORT))
 
 
 def _validate_response(payload, token):
     return verified_context(payload, token)
 
 
-def _request_context(prompt, timeout=1.0):
+def _authenticate_service(token, timeout):
+    """Prove the listener owns the local secret before disclosing a prompt or bearer token."""
+    endpoint = _endpoint().removesuffix("/query")
+    request = Request(f"{endpoint}/challenge", method="GET")
+    with urlopen(request, timeout=timeout) as response:
+        declared = int(response.headers.get("Content-Length", "0") or 0)
+        if declared < 0 or declared > 16_384:
+            raise ValueError("invalid Amitel Brain challenge")
+        raw = response.read(16_385)
+    if len(raw) > 16_384:
+        raise ValueError("invalid Amitel Brain challenge")
+    payload = json.loads(raw)
+    challenge = _validate_response(payload, token)
+    match = re.fullmatch(r"challenge:([0-9a-f]{24})", challenge)
+    if match is None:
+        raise ValueError("Amitel Brain server authentication failed")
+    return match.group(1)
+
+
+def _request_context(prompt, timeout=1.0, harness=None):
     token = service_token()
-    body = json.dumps({"query": prompt[:8000], "max_chars": 2000}).encode("utf-8")
+    nonce = _authenticate_service(token, timeout)
+    request_payload = {
+        "query": prompt[:8000],
+        "max_chars": 2000,
+        "harness": harness or os.environ.get("AMITEL_BRAIN_HARNESS", "unknown"),
+        "trace_id": uuid.uuid4().hex,
+    }
+    body = json.dumps(seal_request(request_payload, token, nonce)).encode("utf-8")
     request = Request(
-        _endpoint(), data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        _endpoint().replace("/query", "/query-secure"), data=body,
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read())
     return _validate_response(payload, token)
-
-
-def _request_health(timeout=1.0):
-    token = service_token()
-    request = Request(
-        _endpoint("/health"),
-        headers={"Authorization": f"Bearer {token}"},
-        method="GET",
-    )
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read())
-    return _validate_response(payload, token)
-
-
-def _shutdown_server():
-    token = service_token()
-    request = Request(
-        _endpoint("/shutdown"), data=b"{}",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        method="POST",
-    )
-    with urlopen(request, timeout=1.0) as response:
-        payload = json.loads(response.read())
-    _validate_response(payload, token)
-
-
-def _wait_for_shutdown(timeout=2.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            _request_health(timeout=0.2)
-        except (URLError, TimeoutError, OSError):
-            return
-        time.sleep(0.05)
-    raise TimeoutError("brain service did not stop")
 
 
 def _server_python():
@@ -107,39 +100,51 @@ def _spawn_server():
     subprocess.Popen(command, **kwargs)
 
 
-def query_service(prompt, startup_timeout=8.0):
-    expected_root = _configured_root()
+def query_service(prompt, startup_timeout=8.0, harness=None):
     try:
-        active_root = _request_health()
-    except (HTTPError, ValueError, json.JSONDecodeError):
+        return _request_context(prompt, harness=harness)
+    except HTTPError as exc:
+        if exc.code == 503:
+            return _wait_for_service(prompt, startup_timeout, harness)
+        return ""  # Occupied port or unauthenticated response: never inject and never retry.
+    except (ValueError, json.JSONDecodeError):
         return ""  # Occupied port or unauthenticated response: never inject and never retry.
     except (URLError, TimeoutError, OSError):
-        active_root = None
-
-    if active_root is not None:
-        if active_root != expected_root:
+        pass
+    startup_mutex = ProcessMutex.try_acquire(f"startup-{_port()}")
+    if startup_mutex is not None:
+        try:
+            # Another hook may have completed startup between the first probe and this lock.
             try:
-                _shutdown_server()
-                _wait_for_shutdown()
-            except (HTTPError, ValueError, json.JSONDecodeError, URLError, TimeoutError, OSError):
+                return _request_context(prompt, harness=harness)
+            except HTTPError as exc:
+                if exc.code == 503:
+                    return _wait_for_service(prompt, startup_timeout, harness)
                 return ""
-        else:
+            except (ValueError, json.JSONDecodeError):
+                return ""
+            except (URLError, TimeoutError, OSError):
+                pass
             try:
-                return _request_context(prompt)
-            except (HTTPError, ValueError, json.JSONDecodeError, URLError, TimeoutError, OSError):
+                _spawn_server()
+            except OSError:
                 return ""
+            return _wait_for_service(prompt, startup_timeout, harness)
+        finally:
+            startup_mutex.close()
+    return _wait_for_service(prompt, startup_timeout, harness)
 
-    try:
-        _spawn_server()
-    except OSError:
-        return ""
+
+def _wait_for_service(prompt, startup_timeout, harness):
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
         try:
-            if _request_health() != expected_root:
+            return _request_context(prompt, harness=harness)
+        except HTTPError as exc:
+            if exc.code != 503:
                 return ""
-            return _request_context(prompt)
-        except (HTTPError, ValueError, json.JSONDecodeError):
+            time.sleep(0.2)
+        except (ValueError, json.JSONDecodeError):
             return ""
         except (URLError, TimeoutError, OSError):
             time.sleep(0.2)
@@ -163,10 +168,14 @@ def hook_output(payload, query_fn=query_service):
 
 def main():
     try:
-        payload = json.loads(sys.stdin.read())
+        # Stdin arrive en UTF-8, parfois BOMé par le wrapper PowerShell (.NET StreamWriter) ;
+        # le décodage locale (cp1252) mangerait BOM et accents → lire binaire + utf-8-sig.
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
         output = hook_output(payload)
         if output:
-            print(json.dumps(output, ensure_ascii=False))
+            # ensure_ascii (défaut) : un stdout cp1252 lèverait UnicodeEncodeError sur
+            # les caractères hors cp1252 des notes ; l'ASCII échappé passe partout.
+            print(json.dumps(output))
     except Exception:
         pass  # Retrieval must never block the user's prompt.
 

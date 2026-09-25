@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$BrainRoot = "",
     [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }),
@@ -35,7 +35,11 @@ if (-not $SkipDependencies) {
             $py = Get-Command py -ErrorAction SilentlyContinue
             if ($py) {
                 & $py.Source -3.11 -m venv $venvRoot
-                if ($LASTEXITCODE -ne 0) { throw "Échec de création du venv avec py" }
+                if ($LASTEXITCODE -ne 0) {
+                    # 3.11 absent (machine avec seulement 3.12+) : le lanceur prend le Python 3 le plus récent.
+                    & $py.Source -3 -m venv $venvRoot
+                    if ($LASTEXITCODE -ne 0) { throw "Échec de création du venv avec py" }
+                }
             } else {
                 $systemPython = Get-Command python -ErrorAction SilentlyContinue
                 if (-not $systemPython) { throw "Installez uv ou Python 3.11, puis relancez install.ps1" }
@@ -45,6 +49,9 @@ if (-not $SkipDependencies) {
         }
     }
     if (-not (Test-Path -LiteralPath $python)) { throw "Le venv local n'a pas été créé: $python" }
+    # numpy 2.3 (requirements.txt) exige Python 3.11 ou plus récent.
+    & $python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+    if ($LASTEXITCODE -ne 0) { throw "Python 3.11 ou plus récent requis dans le venv: $python" }
     $requirements = "$repoRoot/tooling/requirements.txt"
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if ($uv) {
@@ -58,17 +65,17 @@ if (-not $SkipDependencies) {
 if (-not (Test-Path -LiteralPath $python)) { throw "Runtime absent: $python" }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
-$runtimeFiles = @(
-    "brain_auth.py",
-    "brain_context.py",
-    "brain_hook.py",
-    "brain_index.py",
-    "brain_retrieval.py",
-    "brain_server.py"
-)
+# TOUS les modules Python du tooling sont copies, pas une liste nommee a la main. Cette liste
+# etait figee a 7 fichiers alors que le serveur en importe desormais une vingtaine
+# (brain_trace, brain_singleton, brain_curate, brain_validate, brain_attention...) : une
+# reinstallation produisait un serveur qui plantait a l import, ou pire, ecrasait une copie
+# saine par une copie amputee. Constate le 2026-09-02.
+$runtimeFiles = @(Get-ChildItem -LiteralPath "$repoRoot/tooling" -Filter "*.py" -File | ForEach-Object { $_.Name })
+if ($runtimeFiles.Count -lt 1) { throw "aucun module Python trouve dans $repoRoot/tooling" }
+# brain_server.py reste verifie NOMMEMENT : son absence doit echouer fort, pas silencieusement.
+if ($runtimeFiles -notcontains "brain_server.py") { throw "brain_server.py introuvable dans le clone local" }
 foreach ($runtimeFile in $runtimeFiles) {
     $source = "$repoRoot/tooling/$runtimeFile"
-    if (-not (Test-Path -LiteralPath $source)) { throw "$runtimeFile introuvable dans le clone local" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $runtimeRoot $runtimeFile) -Force
 }
 $indexScript = Join-Path $runtimeRoot "brain_index.py"
